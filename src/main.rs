@@ -22,6 +22,11 @@ use libafl_bolts::{
     AsMutSlice,
 };
 
+//https://mmi.hatenablog.com/entry/2019/05/15/183807
+//https://epi052.gitlab.io/notes-to-self/tags/libafl/
+//https://aflplus.plus/docs/parallel_fuzzing/
+
+//シングルスレッドで実行される
 fn main() -> Result<(), libafl::Error> {
     const MAP_SIZE: usize = 65536;
 
@@ -32,6 +37,7 @@ fn main() -> Result<(), libafl::Error> {
 
     let map_observer = {
         //afl-ccでコンパイルされたプログラムのカバレッジは、__AFL_SHM_IDの環境変数が示す共有メモリ名に保存される
+        //シングルスレッドなので、shmemは１個で大丈夫
         shmem.write_to_env("__AFL_SHM_ID").unwrap();
         let shmem_slice = shmem.as_mut_slice();
         HitcountsMapObserver::new(unsafe { StdMapObserver::new("shmem", shmem_slice) })
@@ -41,11 +47,12 @@ fn main() -> Result<(), libafl::Error> {
 
     let (mut fuzzer, mut state) = {
         //新しいカバレッジであるとき、入力コーパスに追加する
-        //なおtime_feedbackは、必ずfalseであるので、条件判定に寄与しないが、これをつけると時間を追跡する？
+        //なおtime_feedbackは、必ずfalseであるので、条件判定に寄与しない
+        //ただし、条件判定に寄与しないものの、Testcaseに実行時間のメタデータを付与してくれる
         let mut feedback = {
             //インデックスは追跡するが、Novelty Searchはしない
-            //true, falseになっているのは、TimeFeedbackも入っているから？
-            //通常用途であれば、MaxMapFeedback::newでいいはず
+            //MaxMapFeedback::new(&map_observer)ではなく、tracking(&map_observer, true, false)になっている理由は？
+            //広くinterestingを取りたいから？入力コーパスへの追加条件を甘くしている？
             let map_feedback = MaxMapFeedback::tracking(&map_observer, true, false);
             let time_feedback = TimeFeedback::with_observer(&time_observer);
             feedback_or!(map_feedback, time_feedback)
@@ -59,6 +66,7 @@ fn main() -> Result<(), libafl::Error> {
         };
 
         let state = {
+            //corpusをondiskにした場合、複数のインスタンス間でcorpusを共有できる？
             let corpus = InMemoryCorpus::<BytesInput>::new();
             let solutions = OnDiskCorpus::new(PathBuf::from("./timeouts"))?;
             let rand = StdRand::with_seed(current_nanos());
@@ -82,6 +90,11 @@ fn main() -> Result<(), libafl::Error> {
 
     // observerはexecutorが所有する
     let mut executor = {
+        //forkserverは典型的なfork -> executeではない
+        //プログラムの開始部分で停止し、指示待ちする。支持ありの場合は、forkする
+        //そのため、executeのコストを削減できる
+        //ForkserverExecutorの場合ははじめのプロセスは、build時に生成される
+        //Exexutor::run_targetでは、はじめのプロセスにforkの指示を送るだけ
         let executor = ForkserverExecutor::builder()
             .program("test")
             .parse_afl_cmdline(["@@"])
@@ -112,8 +125,8 @@ fn main() -> Result<(), libafl::Error> {
     }
 
     if state.metadata_map().get::<Tokens>().is_none() {
-        let token_dir = vec![PathBuf::from("./token")];
-        let tokens = Tokens::new().add_from_files(token_dir)?;
+        let token_dirs = vec![PathBuf::from("./token")];
+        let tokens = Tokens::new().add_from_files(token_dirs)?;
         state.add_metadata(tokens);
     }
 
